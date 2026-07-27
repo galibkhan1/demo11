@@ -1,0 +1,285 @@
+import os
+import json
+import logging
+import urllib.parse
+import random
+import re
+from typing import Optional, Dict, Any
+from datetime import datetime, timedelta
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from ollama import Client
+
+# ==========================================
+# 1. LOGGING CONFIGURATION (With PII Masking)
+# ==========================================
+
+class PIIRedactingFormatter(logging.Formatter):
+    """Redacts email addresses from logs to protect privacy."""
+    def format(self, record):
+        msg = super().format(record)
+        return re.sub(r'([\w\.-]+)@([\w\.-]+)', r'\1@***', msg)
+
+logger = logging.getLogger("NudgeBot")
+if logger.hasHandlers():
+    logger.handlers.clear()
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(PIIRedactingFormatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+logger.addHandler(handler)
+
+# ==========================================
+# 2. CONFIGURATION & VALIDATION
+# ==========================================
+
+CONFIG = {
+    # API Credentials
+    "SLACK_BOT_TOKEN": "", ##os.getenv("SLACK_BOT_TOKEN"),
+    "OLLAMA_API_KEY": os.getenv("OLLAMA_API_KEY"),
+    "OLLAMA_HOST": os.getenv("OLLAMA_HOST", "https://ollama.com"),
+    "MODEL_NAME": "gpt-oss:120b-cloud", 
+    
+    # Target Users
+    "MANAGER_EMAIL": "gurpreet.singh@wiom.in",   ##
+    "CANDIDATE_EMAIL": "daksh@dataproducts.co.in", ##update this from the offered candidate table
+    "CANDIDATE_NAME": os.getenv("Daksh Sahni", "Daksh Sahni"), ##update this from the offered candidate table
+    
+    # Context
+    "CITY": os.getenv("OFFICE_CITY", "gurgaon")
+}
+
+def sanitize_input(text: str, max_length: int = 150) -> str:
+    if not text: return "Unknown"
+    text = str(text)[:max_length]
+    text = "".join(ch for ch in text if ch.isprintable())
+    return re.sub(r'<[^>]*>', '', text).strip()
+
+def validate_nudge_content(data: Dict) -> bool:
+    """Guardrail: Ensures AI content is safe, short, and professional."""
+    required_keys = ["header_emoji", "greeting_text", "insight_text", "meeting_title"]
+    
+    if not all(k in data for k in required_keys):
+        logger.warning("Guardrail: Missing keys in JSON.")
+        return False
+        
+    if len(data["insight_text"]) > 250:
+        logger.warning("Guardrail: Text too verbose.")
+        return False
+    
+    banned_words = ["bro", "dude", "crazy", "sucks", "kill", "stupid"]
+    combined_text = (data["greeting_text"] + data["insight_text"]).lower()
+    if any(w in combined_text for w in banned_words):
+        logger.warning("Guardrail: Unprofessional language detected.")
+        return False
+        
+    return True
+
+# ==========================================
+# 3. NUDGE ENGINE (AI LOGIC)
+# ==========================================
+
+class NudgeEngine:
+    STRATEGIES = {
+        "social_proof": {
+            "prompt": "Reference how 'high-retention leaders' or 'top managers' prioritize the first day.",
+            "tone": "Inspirational and authoritative."
+        },
+        "loss_aversion": {
+            "prompt": "Subtly imply that missing the first lunch creates a feeling of isolation that is hard to fix later.",
+            "tone": "Urgent but supportive."
+        },
+        "fresh_start": {
+            "prompt": "Highlight 'Day 1' as a unique, non-repeatable opportunity to set the culture.",
+            "tone": "Optimistic."
+        }
+    }
+
+    @staticmethod
+    def get_content(candidate_name: str) -> Dict[str, Any]:
+        """Generates the behavioral nudge content."""
+        
+        # 1. Select Strategy
+        strategy_name, strategy_data = random.choice(list(NudgeEngine.STRATEGIES.items()))
+        logger.info(f"Selected Strategy: {strategy_name}")
+
+        # 2. Construct Prompt
+        system_instruction = (
+            "You are a Corporate Behavioral Scientist. "
+            "Task: Write a Slack nudge for a manager to book a welcome lunch. "
+            "Return ONLY valid JSON. No conversational text."
+        )
+
+        user_prompt = (
+            f"Context: {candidate_name} starts tomorrow.\n"
+            f"Strategy: {strategy_data['prompt']}\n"
+            f"Tone: {strategy_data['tone']}\n"
+            f"JSON Schema: {{\"header_emoji\": \"str\", \"greeting_text\": \"str\", \"insight_text\": \"str\", \"button_text\": \"str\", \"meeting_title\": \"str\"}}"
+        )
+
+        # 3. Call AI
+        try:
+            client = Client(host=CONFIG["OLLAMA_HOST"], headers={'Authorization': 'Bearer ' + CONFIG["OLLAMA_API_KEY"]})
+            response = client.chat(
+                model=CONFIG["MODEL_NAME"],
+                messages=[
+                    {'role': 'system', 'content': system_instruction},
+                    {'role': 'user', 'content': user_prompt},
+                ],
+                stream=False
+            )
+            
+            # Clean Response
+            raw_text = response['message']['content']
+            clean_text = re.sub(r"```json|```", "", raw_text).strip()
+            data = json.loads(clean_text)
+            
+            if validate_nudge_content(data):
+                return data
+            else:
+                return NudgeEngine._get_fallback(candidate_name)
+
+        except Exception as e:
+            logger.error(f"AI Generation Error: {e}")
+            return NudgeEngine._get_fallback(candidate_name)
+
+    @staticmethod
+    def _get_fallback(candidate_name: str) -> Dict[str, str]:
+        return {
+            "header_emoji": "🌱",
+            "greeting_text": f"Welcome lunch for {candidate_name}",
+            "insight_text": "Research shows Day 1 lunches increase new hire retention by 25%. It's a small investment.",
+            "button_text": "Block Calendar",
+            "meeting_title": f"Welcome Lunch: {candidate_name}"
+        }
+
+# ==========================================
+# 4. LINK GENERATORS
+# ==========================================
+
+def generate_google_calendar_link(manager_email: str, candidate_email: str, title: str) -> str:
+    """Creates a Google Calendar link for Tomorrow at 1:00 PM with guests pre-filled."""
+    base_url = "https://calendar.google.com/calendar/render"
+    
+    tomorrow = datetime.now() + timedelta(days=1)
+    start_time = tomorrow.replace(hour=13, minute=0, second=0, microsecond=0)
+    end_time = start_time + timedelta(hours=1)
+    dates_str = f"{start_time.strftime('%Y%m%dT%H%M%S')}/{end_time.strftime('%Y%m%dT%H%M%S')}"
+    
+    params = {
+        "action": "TEMPLATE",
+        "text": sanitize_input(title),
+        "details": "Welcome to the team! Let's grab a bite and get you settled in.",
+        "location": "TBD",
+        "dates": dates_str,
+    }
+    query_string = urllib.parse.urlencode(params)
+    
+    # Manually append guests to handle multiple 'add' keys
+    guests = [manager_email, candidate_email]
+    guest_params = "".join([f"&add={urllib.parse.quote(g)}" for g in guests if g])
+    
+    return f"{base_url}?{query_string}{guest_params}"
+
+def get_restaurant_links(city: str) -> Dict[str, str]:
+    """Generates direct links to Zomato/Swiggy Dine-Out sections."""
+    city_clean = city.lower().strip()
+    return {
+        "zomato": f"https://www.zomato.com/{city_clean}/dine-out",
+        "swiggy": "https://www.swiggy.com/dineout"
+    }
+
+# ==========================================
+# 5. MAIN EXECUTION
+# ==========================================
+
+def main():
+    if not CONFIG["SLACK_BOT_TOKEN"]:
+        logger.error("Missing SLACK_BOT_TOKEN. Check environment variables.")
+        return
+
+    slack_client = WebClient(token=CONFIG["SLACK_BOT_TOKEN"])
+    
+    logger.info("Initializing Nudge Protocol...")
+    
+    # 1. Generate Content
+    content = NudgeEngine.get_content(CONFIG["CANDIDATE_NAME"])
+    
+    # 2. Generate Links
+    calendar_url = generate_google_calendar_link(
+        CONFIG["MANAGER_EMAIL"], CONFIG["CANDIDATE_EMAIL"], content['meeting_title']
+    )
+    restaurant_links = get_restaurant_links(CONFIG["CITY"])
+
+    # 3. Build Slack Blocks
+    blocks = [
+        # --- Header & Behavioral Insight ---
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{content['header_emoji']} New Joiner Alert", "emoji": True}
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{content['greeting_text']}*\n{content['insight_text']}"}
+        },
+        {"type": "divider"},
+        
+        # --- Action 1: Block Time (Primary) ---
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "🗓️ *Step 1: Secure the time*"},
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": content['button_text'], "emoji": True},
+                "style": "primary", # Green button
+                "url": calendar_url
+            }
+        },
+        
+        # --- Action 2: Book Venue (Secondary) ---
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": "🍽️ *Step 2: Reserve a table*"}
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Zomato", "emoji": True},
+                    "url": restaurant_links['zomato']
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Swiggy Dineout", "emoji": True},
+                    "url": restaurant_links['swiggy']
+                }
+            ]
+        },
+        
+        # --- Footer Context ---
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Candidate: {CONFIG['CANDIDATE_EMAIL']}"}]
+        }
+    ]
+
+    # 4. Send Message
+    try:
+        user_lookup = slack_client.users_lookupByEmail(email=CONFIG["MANAGER_EMAIL"])
+        user_id = user_lookup['user']['id']
+        
+        slack_client.chat_postMessage(
+            channel=user_id,
+            blocks=blocks,
+            text=f"Action Required: Welcome lunch for {CONFIG['CANDIDATE_NAME']}"
+        )
+        logger.info(f"✅ Nudge successfully sent to {CONFIG['MANAGER_EMAIL']}")
+        
+    except SlackApiError as e:
+        logger.error(f"❌ Slack API Error: {e.response['error']}")
+    except Exception as e:
+        logger.error(f"❌ Unexpected Error: {e}")
+
+if __name__ == "__main__":
+    main()
